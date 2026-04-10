@@ -603,4 +603,146 @@ public:
     }
 };
 
+// ── Global builder ─────────────────────────────────────────────────────────
+//
+// RAII builder for registering functions/values on globalThis.
+//
+//   qjsbind::Global(ctx)
+//       .function("setTimeout", js_setTimeout, 2)
+//       .function("greet", [](std::string name) { return "Hello " + name; })
+//       .value("PI", 3.14159);
+//
+
+class Global {
+    JSContext* ctx_;
+    JSValue global_;
+
+public:
+    explicit Global(JSContext* ctx) : ctx_(ctx), global_(JS_GetGlobalObject(ctx)) {}
+    ~Global() { JS_FreeValue(ctx_, global_); }
+
+    Global(const Global&) = delete;
+    Global& operator=(const Global&) = delete;
+    Global(Global&&) = delete;
+    Global& operator=(Global&&) = delete;
+
+    /// Raw JSCFunction
+    Global& function(const char* name, JSCFunction* fn, int length = 0) {
+        JS_SetPropertyStr(ctx_, global_, name,
+            JS_NewCFunction(ctx_, fn, name, length));
+        return *this;
+    }
+
+    /// Auto-converting typed lambda: ([JSContext*,] args...) → R
+    template<typename Fn>
+        requires (!std::is_convertible_v<std::decay_t<Fn>, JSCFunction*>)
+    Global& function(const char* name, Fn&& fn) {
+        using Caller = detail::StaticCaller<void, std::decay_t<Fn>>;
+        detail::FnStore<std::decay_t<Fn>>::fn.emplace(std::forward<Fn>(fn));
+        JS_SetPropertyStr(ctx_, global_, name,
+            JS_NewCFunction(ctx_,
+                &detail::static_trampoline<void, std::decay_t<Fn>>,
+                name, static_cast<int>(Caller::js_argc)));
+        return *this;
+    }
+
+    /// Raw JSValue (consumes the reference)
+    Global& value(const char* name, JSValue val) {
+        JS_SetPropertyStr(ctx_, global_, name, val);
+        return *this;
+    }
+
+    /// Typed value
+    template<typename V>
+        requires (!std::is_same_v<std::decay_t<V>, JSValue>)
+    Global& value(const char* name, V val) {
+        JS_SetPropertyStr(ctx_, global_, name, Convert<V>::to_js(ctx_, val));
+        return *this;
+    }
+
+    /// Apply JSCFunctionListEntry array
+    Global& function_list(const JSCFunctionListEntry* entries, int count) {
+        JS_SetPropertyFunctionList(ctx_, global_, entries, count);
+        return *this;
+    }
+
+    /// Access the global object for custom manipulation
+    JSValue object() const { return global_; }
+};
+
+// ── Namespace builder ──────────────────────────────────────────────────────
+//
+// RAII builder that creates a named object on globalThis.
+// The object is attached in the destructor.
+//
+//   qjsbind::Namespace(ctx, "Physics")
+//       .function("setGravity", js_setGravity, 3)
+//       .function("step", [](double dt) { world->step(dt); })
+//       .function_list(physics_funcs, physics_funcs_count);
+//
+
+class Namespace {
+    JSContext* ctx_;
+    JSValue obj_;
+    const char* name_;
+
+public:
+    Namespace(JSContext* ctx, const char* name) : ctx_(ctx), name_(name) {
+        obj_ = JS_NewObject(ctx);
+    }
+    ~Namespace() {
+        JSValue global = JS_GetGlobalObject(ctx_);
+        JS_SetPropertyStr(ctx_, global, name_, obj_);
+        JS_FreeValue(ctx_, global);
+    }
+
+    Namespace(const Namespace&) = delete;
+    Namespace& operator=(const Namespace&) = delete;
+    Namespace(Namespace&&) = delete;
+    Namespace& operator=(Namespace&&) = delete;
+
+    /// Raw JSCFunction
+    Namespace& function(const char* name, JSCFunction* fn, int length = 0) {
+        JS_SetPropertyStr(ctx_, obj_, name,
+            JS_NewCFunction(ctx_, fn, name, length));
+        return *this;
+    }
+
+    /// Auto-converting typed lambda: ([JSContext*,] args...) → R
+    template<typename Fn>
+        requires (!std::is_convertible_v<std::decay_t<Fn>, JSCFunction*>)
+    Namespace& function(const char* name, Fn&& fn) {
+        using Caller = detail::StaticCaller<void, std::decay_t<Fn>>;
+        detail::FnStore<std::decay_t<Fn>>::fn.emplace(std::forward<Fn>(fn));
+        JS_SetPropertyStr(ctx_, obj_, name,
+            JS_NewCFunction(ctx_,
+                &detail::static_trampoline<void, std::decay_t<Fn>>,
+                name, static_cast<int>(Caller::js_argc)));
+        return *this;
+    }
+
+    /// Apply JSCFunctionListEntry array
+    Namespace& function_list(const JSCFunctionListEntry* entries, int count) {
+        JS_SetPropertyFunctionList(ctx_, obj_, entries, count);
+        return *this;
+    }
+
+    /// Raw JSValue (consumes the reference)
+    Namespace& value(const char* name, JSValue val) {
+        JS_SetPropertyStr(ctx_, obj_, name, val);
+        return *this;
+    }
+
+    /// Typed value
+    template<typename V>
+        requires (!std::is_same_v<std::decay_t<V>, JSValue>)
+    Namespace& value(const char* name, V val) {
+        JS_SetPropertyStr(ctx_, obj_, name, Convert<V>::to_js(ctx_, val));
+        return *this;
+    }
+
+    /// Access the namespace object for custom manipulation
+    JSValue object() const { return obj_; }
+};
+
 } // namespace qjsbind
