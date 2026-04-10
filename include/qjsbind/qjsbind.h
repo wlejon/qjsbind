@@ -166,6 +166,33 @@ JSValue wrap(JSContext* ctx, T* ptr) {
 struct returns_this_t {};
 inline constexpr returns_this_t returns_this{};
 
+// ── Class registration flags ───────────────────────────────────────────────
+
+enum ClassFlag : unsigned {
+    NoGlobal     = 1u << 0,  // Don't register constructor on globalThis
+    NoDestructor = 1u << 1,  // Don't delete opaque pointer in finalizer
+};
+
+constexpr unsigned operator|(ClassFlag a, ClassFlag b) {
+    return static_cast<unsigned>(a) | static_cast<unsigned>(b);
+}
+constexpr unsigned operator|(unsigned a, ClassFlag b) {
+    return a | static_cast<unsigned>(b);
+}
+
+// ── Wrap without ownership (for borrowed pointers) ─────────────────────────
+
+template<typename T>
+JSValue wrap_unowned(JSContext* ctx, T* ptr) {
+    if (!ptr) return JS_NULL;
+    JSValue proto = JS_GetClassProto(ctx, class_id<T>());
+    JSValue obj = JS_NewObjectProtoClass(ctx, proto, class_id<T>());
+    JS_FreeValue(ctx, proto);
+    if (JS_IsException(obj)) return obj;
+    JS_SetOpaque(obj, ptr);
+    return obj;
+}
+
 // ── Detail: trampolines & call helpers ──────────────────────────────────────
 
 namespace detail {
@@ -372,6 +399,7 @@ class Class {
     JSRuntime* rt_;
     JSValue proto_;
     const char* name_;
+    unsigned flags_ = 0;
 
     // Constructor C function pointer (null = not constructible)
     JSCFunction* ctor_fn_ = nullptr;
@@ -390,13 +418,33 @@ class Class {
     }
 
 public:
-    Class(JSContext* ctx, const char* name) : ctx_(ctx), name_(name) {
+    /// Basic constructor (default delete-ptr finalizer unless NoDestructor).
+    Class(JSContext* ctx, const char* name, unsigned flags = 0)
+        : ctx_(ctx), name_(name), flags_(flags) {
         rt_ = JS_GetRuntime(ctx);
         auto& id = class_id<T>();
         if (id == 0) JS_NewClassID(rt_, &id);
         JSClassDef def{};
         def.class_name = name;
-        def.finalizer = destructor;
+        def.finalizer = (flags & NoDestructor) ? nullptr : destructor;
+        JS_NewClass(rt_, id, &def);
+        proto_ = JS_NewObject(ctx);
+    }
+
+    /// Extended constructor with custom finalizer and/or exotic methods.
+    /// If finalizer is non-null it overrides the default (and NoDestructor flag).
+    Class(JSContext* ctx, const char* name, unsigned flags,
+          JSClassFinalizer* finalizer,
+          JSClassExoticMethods* exotic = nullptr)
+        : ctx_(ctx), name_(name), flags_(flags) {
+        rt_ = JS_GetRuntime(ctx);
+        auto& id = class_id<T>();
+        if (id == 0) JS_NewClassID(rt_, &id);
+        JSClassDef def{};
+        def.class_name = name;
+        def.finalizer = finalizer ? finalizer
+                      : ((flags & NoDestructor) ? nullptr : destructor);
+        def.exotic = exotic;
         JS_NewClass(rt_, id, &def);
         proto_ = JS_NewObject(ctx);
     }
@@ -422,10 +470,15 @@ public:
         // Register class prototype (consumes our proto_ ref)
         JS_SetClassProto(ctx_, class_id<T>(), proto_);
 
-        // Put constructor on globalThis (consumes our ctor ref)
-        JSValue global = JS_GetGlobalObject(ctx_);
-        JS_SetPropertyStr(ctx_, global, name_, ctor);
-        JS_FreeValue(ctx_, global);
+        if (flags_ & NoGlobal) {
+            // Don't register on globalThis — free the constructor
+            JS_FreeValue(ctx_, ctor);
+        } else {
+            // Put constructor on globalThis (consumes our ctor ref)
+            JSValue global = JS_GetGlobalObject(ctx_);
+            JS_SetPropertyStr(ctx_, global, name_, ctor);
+            JS_FreeValue(ctx_, global);
+        }
     }
 
     // ── Constructor ─────────────────────────────────────────────────────────
@@ -518,11 +571,34 @@ public:
         return *this;
     }
 
+    // ── Raw method — escape hatch for complex arg parsing ─────────────────
+    // fn is a standard JSCFunction: (ctx, this_val, argc, argv) → JSValue
+
+    Class& method_raw(const char* name, JSCFunction* fn, int length = 0) {
+        JS_SetPropertyStr(ctx_, proto_, name,
+            JS_NewCFunction(ctx_, fn, name, length));
+        return *this;
+    }
+
+    // ── Raw static method — escape hatch for complex arg parsing ────────
+
+    Class& static_raw(const char* name, JSCFunction* fn, int length = 0) {
+        statics_.push_back({name, JS_NewCFunction(ctx_, fn, name, length)});
+        return *this;
+    }
+
     // ── Static value (constant on constructor) ──────────────────────────────
 
     template<typename V>
     Class& value(const char* name, V val) {
         statics_.push_back({name, Convert<V>::to_js(ctx_, val)});
+        return *this;
+    }
+
+    // ── Raw function list — apply JSCFunctionListEntry array to prototype ──
+
+    Class& function_list(const JSCFunctionListEntry* entries, int count) {
+        JS_SetPropertyFunctionList(ctx_, proto_, entries, count);
         return *this;
     }
 };
