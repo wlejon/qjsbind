@@ -417,6 +417,24 @@ class Class {
         delete ptr;
     }
 
+    // User-supplied gc_mark callback for instances of T. Stored per-T so the
+    // single trampoline registered on the class can dispatch into it.
+    // Without a gc_mark, QuickJS's cycle GC can't see JSValue fields stored
+    // inside the C++ wrapper, so wrapper ↔ stored-callback cycles leak.
+    using GcMarkFn = void (*)(T*, JSRuntime*, JS_MarkFunc*);
+    static GcMarkFn& gc_mark_fn() {
+        static GcMarkFn fn = nullptr;
+        return fn;
+    }
+
+    static void gc_mark_trampoline(JSRuntime* rt, JSValueConst val,
+                                   JS_MarkFunc* mark_func) {
+        if (auto fn = gc_mark_fn()) {
+            auto* ptr = static_cast<T*>(JS_GetOpaque(val, class_id<T>()));
+            if (ptr) fn(ptr, rt, mark_func);
+        }
+    }
+
 public:
     /// Basic constructor (default delete-ptr finalizer unless NoDestructor).
     Class(JSContext* ctx, const char* name, unsigned flags = 0)
@@ -427,6 +445,7 @@ public:
         JSClassDef def{};
         def.class_name = name;
         def.finalizer = (flags & NoDestructor) ? nullptr : destructor;
+        def.gc_mark = gc_mark_trampoline;
         JS_NewClass(rt_, id, &def);
         proto_ = JS_NewObject(ctx);
     }
@@ -444,6 +463,7 @@ public:
         def.class_name = name;
         def.finalizer = finalizer ? finalizer
                       : ((flags & NoDestructor) ? nullptr : destructor);
+        def.gc_mark = gc_mark_trampoline;
         def.exotic = exotic;
         JS_NewClass(rt_, id, &def);
         proto_ = JS_NewObject(ctx);
@@ -577,6 +597,22 @@ public:
     Class& method_raw(const char* name, JSCFunction* fn, int length = 0) {
         JS_SetPropertyStr(ctx_, proto_, name,
             JS_NewCFunction(ctx_, fn, name, length));
+        return *this;
+    }
+
+    // ── GC mark — declare which JSValue fields the cycle GC must traverse ──
+    // Without this, JSValues stored inside the C++ wrapper are invisible to
+    // QuickJS's cycle GC, so wrapper ↔ stored-callback cycles leak. The
+    // callback should call JS_MarkValue on each JSValue field that holds a
+    // reference (stored via JS_DupValue).
+    //
+    // Example:
+    //   Class<MyData>(ctx, "MyData")
+    //       .gc_mark([](MyData* d, JSRuntime* rt, JS_MarkFunc* mark) {
+    //           JS_MarkValue(rt, d->callback, mark);
+    //       })
+    Class& gc_mark(GcMarkFn fn) {
+        gc_mark_fn() = fn;
         return *this;
     }
 
