@@ -220,6 +220,37 @@ inline std::vector<int32_t> read_int32_array(JSContext* ctx, JSValueConst val) {
     return out;
 }
 
+// ── Promise helpers ─────────────────────────────────────────────────────────
+//
+// Both helpers consume their second argument (the promise resolves/rejects
+// with `value`/`error`, then both resolving functions are freed, then the
+// argument is freed). For the asynchronous case where the resolve/reject
+// functions need to outlive the call (e.g. dispatched back from another
+// thread), keep using JS_NewPromiseCapability directly — these helpers are
+// only for the immediate-resolution shape.
+
+inline JSValue make_resolved_promise(JSContext* ctx, JSValue value) {
+    JSValue resolving[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, resolving);
+    JSValue r = JS_Call(ctx, resolving[0], JS_UNDEFINED, 1, &value);
+    JS_FreeValue(ctx, r);
+    JS_FreeValue(ctx, resolving[0]);
+    JS_FreeValue(ctx, resolving[1]);
+    JS_FreeValue(ctx, value);
+    return promise;
+}
+
+inline JSValue make_rejected_promise(JSContext* ctx, JSValue error) {
+    JSValue resolving[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, resolving);
+    JSValue r = JS_Call(ctx, resolving[1], JS_UNDEFINED, 1, &error);
+    JS_FreeValue(ctx, r);
+    JS_FreeValue(ctx, resolving[0]);
+    JS_FreeValue(ctx, resolving[1]);
+    JS_FreeValue(ctx, error);
+    return promise;
+}
+
 // ── Class ID / wrap / unwrap ────────────────────────────────────────────────
 
 template<typename T>
