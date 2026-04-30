@@ -5,6 +5,7 @@
 #include "quickjs.h"
 
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -133,6 +134,91 @@ struct Convert<std::optional<T>> {
         return Convert<T>::to_js(ctx, *val);
     }
 };
+
+// ── Typed-array marshaling ──────────────────────────────────────────────────
+
+// Build a Float32Array from a contiguous float buffer (data is copied).
+inline JSValue make_float32_array(JSContext* ctx, const float* data, size_t count) {
+    JSValue abuf = JS_NewArrayBufferCopy(
+        ctx, reinterpret_cast<const uint8_t*>(data), count * sizeof(float));
+    JSValue args[3] = { abuf, JS_UNDEFINED, JS_UNDEFINED };
+    JSValue arr = JS_NewTypedArray(ctx, 1, args, JS_TYPED_ARRAY_FLOAT32);
+    JS_FreeValue(ctx, abuf);
+    return arr;
+}
+
+// Build an Int32Array from a contiguous int32 buffer (data is copied).
+inline JSValue make_int32_array(JSContext* ctx, const int32_t* data, size_t count) {
+    JSValue abuf = JS_NewArrayBufferCopy(
+        ctx, reinterpret_cast<const uint8_t*>(data), count * sizeof(int32_t));
+    JSValue args[3] = { abuf, JS_UNDEFINED, JS_UNDEFINED };
+    JSValue arr = JS_NewTypedArray(ctx, 1, args, JS_TYPED_ARRAY_INT32);
+    JS_FreeValue(ctx, abuf);
+    return arr;
+}
+
+inline JSValue make_float32_array(JSContext* ctx, const std::vector<float>& v) {
+    return make_float32_array(ctx, v.data(), v.size());
+}
+
+inline JSValue make_int32_array(JSContext* ctx, const std::vector<int32_t>& v) {
+    return make_int32_array(ctx, v.data(), v.size());
+}
+
+// Read a Float32Array (or any typed-array view backed by floats) into a vector.
+// Returns empty if val is not a typed-array view.
+inline std::vector<float> read_float32_array(JSContext* ctx, JSValueConst val) {
+    std::vector<float> out;
+    if (JS_IsUndefined(val) || JS_IsNull(val)) return out;
+    size_t byte_off = 0, view_len = 0;
+    JSValue abuf = JS_GetTypedArrayBuffer(ctx, val, &byte_off, &view_len, nullptr);
+    if (JS_IsException(abuf)) { JS_FreeValue(ctx, JS_GetException(ctx)); return out; }
+    size_t abuf_len = 0;
+    uint8_t* raw = JS_GetArrayBuffer(ctx, &abuf_len, abuf);
+    JS_FreeValue(ctx, abuf);
+    if (!raw) return out;
+    const size_t n = view_len / sizeof(float);
+    out.resize(n);
+    if (n > 0) std::memcpy(out.data(), raw + byte_off, n * sizeof(float));
+    return out;
+}
+
+// Read an Int32Array view, falling back to a plain JS Array<number>.
+inline std::vector<int32_t> read_int32_array(JSContext* ctx, JSValueConst val) {
+    std::vector<int32_t> out;
+    if (JS_IsUndefined(val) || JS_IsNull(val)) return out;
+
+    size_t byte_off = 0, view_len = 0;
+    JSValue abuf = JS_GetTypedArrayBuffer(ctx, val, &byte_off, &view_len, nullptr);
+    if (!JS_IsException(abuf)) {
+        size_t abuf_len = 0;
+        uint8_t* raw = JS_GetArrayBuffer(ctx, &abuf_len, abuf);
+        JS_FreeValue(ctx, abuf);
+        if (raw) {
+            const size_t n = view_len / sizeof(int32_t);
+            out.resize(n);
+            if (n > 0) std::memcpy(out.data(), raw + byte_off, n * sizeof(int32_t));
+            return out;
+        }
+    } else {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+
+    if (!JS_IsArray(val)) return out;
+    JSValue len_v = JS_GetPropertyStr(ctx, val, "length");
+    uint32_t len = 0;
+    JS_ToUint32(ctx, &len, len_v);
+    JS_FreeValue(ctx, len_v);
+    out.reserve(len);
+    for (uint32_t i = 0; i < len; ++i) {
+        JSValue elem = JS_GetPropertyUint32(ctx, val, i);
+        int32_t x = 0;
+        JS_ToInt32(ctx, &x, elem);
+        JS_FreeValue(ctx, elem);
+        out.push_back(x);
+    }
+    return out;
+}
 
 // ── Class ID / wrap / unwrap ────────────────────────────────────────────────
 
