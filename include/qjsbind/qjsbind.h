@@ -165,21 +165,40 @@ inline JSValue make_int32_array(JSContext* ctx, const std::vector<int32_t>& v) {
     return make_int32_array(ctx, v.data(), v.size());
 }
 
-// Read a Float32Array (or any typed-array view backed by floats) into a vector.
-// Returns empty if val is not a typed-array view.
+// Read a Float32Array view, falling back to a plain JS Array<number>
+// (matching read_int32_array). Returns empty for anything else.
 inline std::vector<float> read_float32_array(JSContext* ctx, JSValueConst val) {
     std::vector<float> out;
     if (JS_IsUndefined(val) || JS_IsNull(val)) return out;
     size_t byte_off = 0, view_len = 0;
     JSValue abuf = JS_GetTypedArrayBuffer(ctx, val, &byte_off, &view_len, nullptr);
-    if (JS_IsException(abuf)) { JS_FreeValue(ctx, JS_GetException(ctx)); return out; }
-    size_t abuf_len = 0;
-    uint8_t* raw = JS_GetArrayBuffer(ctx, &abuf_len, abuf);
-    JS_FreeValue(ctx, abuf);
-    if (!raw) return out;
-    const size_t n = view_len / sizeof(float);
-    out.resize(n);
-    if (n > 0) std::memcpy(out.data(), raw + byte_off, n * sizeof(float));
+    if (!JS_IsException(abuf)) {
+        size_t abuf_len = 0;
+        uint8_t* raw = JS_GetArrayBuffer(ctx, &abuf_len, abuf);
+        JS_FreeValue(ctx, abuf);
+        if (raw) {
+            const size_t n = view_len / sizeof(float);
+            out.resize(n);
+            if (n > 0) std::memcpy(out.data(), raw + byte_off, n * sizeof(float));
+            return out;
+        }
+    } else {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+
+    if (!JS_IsArray(val)) return out;
+    JSValue len_v = JS_GetPropertyStr(ctx, val, "length");
+    uint32_t len = 0;
+    JS_ToUint32(ctx, &len, len_v);
+    JS_FreeValue(ctx, len_v);
+    out.reserve(len);
+    for (uint32_t i = 0; i < len; ++i) {
+        JSValue elem = JS_GetPropertyUint32(ctx, val, i);
+        double x = 0;
+        JS_ToFloat64(ctx, &x, elem);
+        JS_FreeValue(ctx, elem);
+        out.push_back(static_cast<float>(x));
+    }
     return out;
 }
 
@@ -218,6 +237,78 @@ inline std::vector<int32_t> read_int32_array(JSContext* ctx, JSValueConst val) {
         out.push_back(x);
     }
     return out;
+}
+
+// Zero-copy view of a typed-array's elements. Returns the element pointer and
+// count without copying; {nullptr, 0} if `val` is not a typed-array view with
+// the expected element size. The pointer aliases the JS ArrayBuffer — it is
+// valid only until control returns to JS (any allocation/GC can move or free
+// the buffer), so consume or copy it before calling back into the engine.
+template<typename T>
+inline const T* read_typed_array_view(JSContext* ctx, JSValueConst val, size_t& count) {
+    count = 0;
+    if (!JS_IsObject(val)) return nullptr;
+    size_t byte_off = 0, view_len = 0, bpe = 0;
+    JSValue abuf = JS_GetTypedArrayBuffer(ctx, val, &byte_off, &view_len, &bpe);
+    if (JS_IsException(abuf)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return nullptr;
+    }
+    size_t abuf_len = 0;
+    uint8_t* raw = JS_GetArrayBuffer(ctx, &abuf_len, abuf);
+    JS_FreeValue(ctx, abuf);
+    if (!raw || bpe != sizeof(T)) return nullptr;
+    count = view_len / sizeof(T);
+    return reinterpret_cast<const T*>(raw + byte_off);
+}
+
+inline const float* read_float32_view(JSContext* ctx, JSValueConst val, size_t& count) {
+    return read_typed_array_view<float>(ctx, val, count);
+}
+
+inline const int32_t* read_int32_view(JSContext* ctx, JSValueConst val, size_t& count) {
+    return read_typed_array_view<int32_t>(ctx, val, count);
+}
+
+// ── Option-object property getters ──────────────────────────────────────────
+//
+// Read one property off an options object with a default. These are the
+// idiomatic accessors for `fn(target, {speed: 2, loop: true})`-style APIs;
+// each does the get/convert/free dance in one call and never throws.
+
+inline double get_prop_number(JSContext* ctx, JSValueConst obj, const char* prop,
+                              double def = 0.0) {
+    JSValue v = JS_GetPropertyStr(ctx, obj, prop);
+    double r = def;
+    if (!JS_IsUndefined(v) && !JS_IsNull(v)) JS_ToFloat64(ctx, &r, v);
+    JS_FreeValue(ctx, v);
+    return r;
+}
+
+inline int get_prop_int(JSContext* ctx, JSValueConst obj, const char* prop,
+                        int def = 0) {
+    return static_cast<int>(get_prop_number(ctx, obj, prop, def));
+}
+
+inline bool get_prop_bool(JSContext* ctx, JSValueConst obj, const char* prop,
+                          bool def = false) {
+    JSValue v = JS_GetPropertyStr(ctx, obj, prop);
+    bool r = def;
+    if (!JS_IsUndefined(v) && !JS_IsNull(v)) r = JS_ToBool(ctx, v);
+    JS_FreeValue(ctx, v);
+    return r;
+}
+
+inline std::string get_prop_string(JSContext* ctx, JSValueConst obj, const char* prop,
+                                   const char* def = "") {
+    JSValue v = JS_GetPropertyStr(ctx, obj, prop);
+    std::string r = def;
+    if (JS_IsString(v)) {
+        const char* s = JS_ToCString(ctx, v);
+        if (s) { r = s; JS_FreeCString(ctx, s); }
+    }
+    JS_FreeValue(ctx, v);
+    return r;
 }
 
 // ── Promise helpers ─────────────────────────────────────────────────────────
