@@ -14,10 +14,13 @@ concurrency:
 
 # qjsbind is header-only, so CodeQL extracts it through the test binary — the
 # only TU that instantiates the templates. Building that binary also compiles
-# QuickJS, but the analysis is scoped to qjsbind's own headers via the config's
-# paths-ignore: QuickJS is a large upstream C interpreter with its own security
-# process, and folding its findings in here would bury the ones that are
-# actionable in this repo.
+# QuickJS, which must be kept out of the analysis: it is a large upstream C
+# interpreter with its own security process, and its findings would bury the
+# ones actionable in this repo. The exclusion is by build order — QuickJS is
+# compiled ahead of `init`, and for a compiled language CodeQL only extracts
+# what it observes the compiler build while tracing (paths-ignore does not
+# filter compiled sources). Only qjsbind_test is traced, so only qjsbind's own
+# headers (and the test that drives them) are analysed.
 #
 # What is worth finding here: this is a binding layer that hands raw JSValue
 # handles across the C/C++ boundary, converts between JS and C++ types, and
@@ -43,18 +46,27 @@ jobs:
           ref: 4869a1efa9550899ba720817abcf9973a25d1635
           path: third_party/quickjs
 
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+      # QuickJS is compiled here, ahead of `init`, so it is never traced. Only
+      # qjsbind_test is built afterwards, and it is the sole TU that instantiates
+      # the header-only bindings.
+      - name: Pre-build QuickJS (outside the traced build)
+        run: cmake --build build --parallel 4 --target qjs
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
           languages: c-cpp
           build-mode: manual
           queries: security-extended
+          # Second line of defence: drops any finding originating in a QuickJS
+          # *header* pulled into the test TU, which build order cannot catch.
           config-file: ./.github/codeql/codeql-config.yml
 
-      - name: Build (tests — the only TUs that instantiate the headers)
-        run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-          cmake --build build --parallel 4
+      - name: Build qjsbind test (traced — instantiates the headers)
+        run: cmake --build build --parallel 4 --target qjsbind_test
 
       - name: Analyze
         uses: github/codeql-action/analyze@v4
