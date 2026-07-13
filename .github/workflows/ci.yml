@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# qjsbind is a header-only C++20 binding layer over QuickJS. There is nothing to
+# compile until a consumer instantiates the headers, and the headers do not even
+# declare their test target unless a `qjs` target exists (see the guard in
+# CMakeLists.txt) — so CI has to supply QuickJS before any of this builds.
+#
+# QuickJS is checked out at the exact commit the stack vendors: brokit carries
+# it as a submodule pinned to 4869a1e, and qjsbind's default QJS_DIR points at
+# `../brokit/third_party/quickjs`. Rather than clone brokit and its other
+# submodules, this pins quickjs-ng directly into the `third_party/quickjs`
+# fallback path at that same SHA — keep it in step with brokit's submodule when
+# that bumps. `cmake -S .` then finds it and builds the `qjs` target, which
+# unlocks the test target.
+#
+# The point of this file is the same as bromath's: a header-only library is
+# recompiled inside every consumer, so what matters is that all four toolchains
+# accept it. A binding template that MSVC folds differently from GCC is caught
+# here, not downstream.
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-gcc,    os: ubuntu-24.04, cc: gcc,   cxx: g++ }
+          - { name: linux-clang,  os: ubuntu-24.04, cc: clang, cxx: clang++ }
+          - { name: windows-msvc, os: windows-2022 }
+          - { name: macos-arm64,  os: macos-14 }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch QuickJS (pinned to brokit's submodule commit)
+        uses: actions/checkout@v7
+        with:
+          repository: quickjs-ng/quickjs
+          ref: 4869a1efa9550899ba720817abcf9973a25d1635
+          path: third_party/quickjs
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build --config Debug --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build -C Debug --output-on-failure
+
+  # ── Coverage ──────────────────────────────────────────────────────────────
+  #
+  # --filter include/qjsbind/ so the report is the binding headers, counted
+  # where the test TU includes them. QuickJS is instrumented too (it has to link
+  # against the same runtime) but is filtered out of the numbers.
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch QuickJS (pinned to brokit's submodule commit)
+        uses: actions/checkout@v7
+        with:
+          repository: quickjs-ng/quickjs
+          ref: 4869a1efa9550899ba720817abcf9973a25d1635
+          path: third_party/quickjs
+
+      - name: Install gcovr
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends gcovr
+
+      - name: Configure (instrumented)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_FLAGS="--coverage" \
+            -DCMAKE_CXX_FLAGS="--coverage" \
+            -DCMAKE_EXE_LINKER_FLAGS="--coverage"
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      # pipefail: piping gcovr into tee otherwise hands the step tee's exit
+      # status, so a gcovr crash produces no report and the job still goes green.
+      - name: Report
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p coverage-html
+          gcovr --root . \
+            --filter 'include/qjsbind/' \
+            --exclude-unreachable-branches \
+            --gcov-ignore-errors=no_working_dir_found \
+            --print-summary \
+            --html-details coverage-html/index.html \
+            | tee coverage-summary.txt
+          test -s coverage-html/index.html
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo '## Coverage — `include/qjsbind/`'
+            echo
+            echo 'Header-only: the binding headers are counted where the test TU'
+            echo 'includes them. QuickJS is filtered out of the report.'
+            echo
+            echo '```'
+            cat coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-html
+          path: coverage-html/
+          retention-days: 14

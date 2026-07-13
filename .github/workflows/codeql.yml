@@ -1,0 +1,62 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+# qjsbind is header-only, so CodeQL extracts it through the test binary — the
+# only TU that instantiates the templates. Building that binary also compiles
+# QuickJS, but the analysis is scoped to qjsbind's own headers via the config's
+# paths-ignore: QuickJS is a large upstream C interpreter with its own security
+# process, and folding its findings in here would bury the ones that are
+# actionable in this repo.
+#
+# What is worth finding here: this is a binding layer that hands raw JSValue
+# handles across the C/C++ boundary, converts between JS and C++ types, and
+# manages QuickJS refcounts by hand. Reference miscounts, wrong-tag reads, and
+# lifetime slips are exactly the class of bug a checker catches and a reviewer
+# skims past.
+jobs:
+  analyze:
+    name: Analyze C++
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch QuickJS (pinned to brokit's submodule commit)
+        uses: actions/checkout@v7
+        with:
+          repository: quickjs-ng/quickjs
+          ref: 4869a1efa9550899ba720817abcf9973a25d1635
+          path: third_party/quickjs
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: c-cpp
+          build-mode: manual
+          queries: security-extended
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Build (tests — the only TUs that instantiate the headers)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build --parallel 4
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:c-cpp

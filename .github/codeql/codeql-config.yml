@@ -1,0 +1,12 @@
+name: qjsbind CodeQL config
+
+queries:
+  - uses: security-extended
+
+# QuickJS is checked out under third_party/quickjs only so the header-only
+# binding layer has something to instantiate against. It is a large upstream C
+# interpreter with its own maintainers and security process; its findings are
+# not qjsbind's to triage, and mixed into this repo's Security tab they would
+# drown the handful that are. Scope the analysis to qjsbind's own headers.
+paths-ignore:
+  - third_party

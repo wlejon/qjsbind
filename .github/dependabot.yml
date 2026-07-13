@@ -1,0 +1,18 @@
+version: 2
+
+# qjsbind is header-only with no package-manager dependencies — QuickJS is
+# supplied by the consumer (the sibling brokit's submodule) and only pulled into
+# CI to have something to compile against. The only versioned things in the repo
+# are the pinned actions in .github/workflows/.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    labels: [ci]
+    commit-message:
+      prefix: "ci"
