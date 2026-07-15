@@ -1,5 +1,9 @@
 # qjsbind
 
+[![CI](https://github.com/wlejon/qjsbind/actions/workflows/ci.yml/badge.svg)](https://github.com/wlejon/qjsbind/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/wlejon/qjsbind/actions/workflows/codeql.yml/badge.svg)](https://github.com/wlejon/qjsbind/actions/workflows/codeql.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A C++20 header-only binding library for [QuickJS](https://bellard.org/quickjs/), providing a fluent API to expose C++ classes and functions to JavaScript with minimal boilerplate.
 
 ## Features
