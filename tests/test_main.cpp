@@ -23,6 +23,16 @@ static bool eval_ok(JSContext* ctx, const char* code, const char* name) {
     return true;
 }
 
+// For the cases where throwing *is* the answer, so an expected exception does
+// not print itself as a failure.
+static bool eval_throws(JSContext* ctx, const char* code) {
+    JSValue r = JS_Eval(ctx, code, strlen(code), "<eval>", JS_EVAL_TYPE_GLOBAL);
+    const bool threw = JS_IsException(r);
+    if (threw) JS_FreeValue(ctx, JS_GetException(ctx));
+    JS_FreeValue(ctx, r);
+    return threw;
+}
+
 static void check(bool cond, const char* name) {
     if (cond) { g_passed++; }
     else { g_failed++; printf("  FAIL: %s\n", name); }
@@ -253,7 +263,7 @@ static void test_no_constructor(JSContext* ctx) {
         });
 
     // new Internal() should throw
-    check(!eval_ok(ctx, "new Internal();", "no ctor"), "no ctor throws");
+    check(eval_throws(ctx, "new Internal();"), "no ctor throws");
 
     // But static factory works
     check(eval_ok(ctx, "var i = Internal.make(5);", "factory"), "factory");
@@ -280,6 +290,101 @@ static void test_value(JSContext* ctx) {
     check(eval_double(ctx, "Flags.EXEC") == 4.0, "value EXEC");
 }
 
+// ── Per-registration callable storage ───────────────────────────────────────
+//
+// Every registration owns its own callable, which is what lets a family of
+// related calls come out of one lambda expression with different captures and
+// makes a function pointer as safe to register as a lambda. Both used to share
+// one static slot per callable *type*, and silently: whichever was registered
+// last answered for every name that shared it.
+
+struct Sizes {
+    int n = 0;
+};
+
+static double size_half(Sizes* s) { return s->n / 2.0; }
+static double size_twice(Sizes* s) { return s->n * 2.0; }
+
+static void test_registration_identity(JSContext* ctx) {
+    printf("test_registration_identity\n");
+
+    // One lambda expression, three registrations, three different captures.
+    {
+        qjsbind::Namespace ns(ctx, "Counters");
+        static const char* const names[] = {"one", "two", "three"};
+        for (int i = 0; i < 3; ++i)
+            ns.function(names[i], [i](int mul) { return (i + 1) * mul; });
+    }
+    check(eval_double(ctx, "Counters.one(10)") == 10.0, "first of a family");
+    check(eval_double(ctx, "Counters.two(10)") == 20.0, "second of a family");
+    check(eval_double(ctx, "Counters.three(10)") == 30.0, "third of a family");
+
+    // One lambda handed to two names, and a capture with a destructor.
+    {
+        qjsbind::Namespace ns(ctx, "Greet");
+        auto greeter = [](std::string who) { return "hello " + who; };
+        ns.function("en", greeter);
+        ns.function("also", greeter);
+        ns.function("fr", [prefix = std::string("bonjour ")](std::string who) {
+            return prefix + who;
+        });
+    }
+    check(eval_string(ctx, "Greet.en('world')") == "hello world", "one lambda, first name");
+    check(eval_string(ctx, "Greet.also('world')") == "hello world", "one lambda, second name");
+    check(eval_string(ctx, "Greet.fr('monde')") == "bonjour monde", "captured std::string");
+
+    // Two function pointers of one signature — one type, two registrations.
+    qjsbind::Class<Sizes>(ctx, "Sizes")
+        .constructor([](JSContext* ctx, int argc, JSValueConst* argv) -> Sizes* {
+            int32_t n = 0;
+            if (argc > 0) JS_ToInt32(ctx, &n, argv[0]);
+            return new Sizes{n};
+        })
+        .get("half", &size_half)
+        .get("twice", &size_twice);
+
+    check(eval_ok(ctx, "var sz = new Sizes(8);", "sizes ctor"), "sizes ctor");
+    check(eval_double(ctx, "sz.half") == 4.0, "first function pointer");
+    check(eval_double(ctx, "sz.twice") == 16.0, "second function pointer");
+
+    // Still an ordinary function to JavaScript, and still a constructor that
+    // says so when it is reached without `new`.
+    check(eval_string(ctx, "Counters.one.name") == "one", "function keeps its name");
+    check(eval_double(ctx, "Counters.one.length") == 1.0, "function keeps its length");
+    check(eval_bool(ctx, "typeof Sizes === 'function'"), "constructor is a function");
+    check(eval_throws(ctx, "Sizes(8);"), "constructor without new throws");
+}
+
+static void test_nested_namespace(JSContext* ctx) {
+    printf("test_nested_namespace\n");
+
+    // A namespace inside a namespace: the shape of a host surface that lives a
+    // level or two down rather than on globalThis.
+    {
+        qjsbind::Namespace outer(ctx, "Host");
+        outer.value("version", 2);
+        {
+            qjsbind::Namespace inner(outer, "codecs");
+            inner.function("count", [] { return 7; });
+        }
+    }
+    check(eval_double(ctx, "Host.version") == 2.0, "value on the outer namespace");
+    check(eval_double(ctx, "Host.codecs.count()") == 7.0, "call on the inner one");
+
+    // The same thing given a borrowed object rather than a namespace.
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue host = JS_GetPropertyStr(ctx, global, "Host");
+    {
+        qjsbind::Namespace inner(ctx, host, "muxers");
+        inner.function("count", [] { return 3; });
+    }
+    qjsbind::set_function(ctx, host, "name", [] { return std::string("qjs"); });
+    JS_FreeValue(ctx, host);
+    JS_FreeValue(ctx, global);
+    check(eval_double(ctx, "Host.muxers.count()") == 3.0, "namespace inside a borrowed object");
+    check(eval_string(ctx, "Host.name()") == "qjs", "function on a borrowed object");
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -293,6 +398,8 @@ int main() {
     test_auto_wrap_return(ctx);
     test_no_constructor(ctx);
     test_value(ctx);
+    test_registration_identity(ctx);
+    test_nested_namespace(ctx);
 
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);

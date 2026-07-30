@@ -401,16 +401,50 @@ JSValue wrap_unowned(JSContext* ctx, T* ptr) {
     return obj;
 }
 
-// ── Detail: trampolines & call helpers ──────────────────────────────────────
+// ── Detail: callable storage, trampolines & call helpers ────────────────────
 
 namespace detail {
 
-// Lambda storage — each unique Fn type gets its own static slot.
-// Safe because each C++ lambda expression has a unique type.
+// Where a registered callable lives: on the function object that calls it.
+//
+// A closure has to outlive the registration call and die with the JS function
+// it was registered as, and QuickJS hands us exactly that — `JS_NewCClosure`
+// carries a `void*` and a finalizer for it. So a registration heap-allocates
+// its callable and the function object owns it. Two registrations never share
+// storage, a second runtime installing the same bindings gets its own captures,
+// and the callable is freed when the function is collected.
+//
+// This replaced one `static` slot per callable *type*, which was wrong three
+// ways and silent in all of them. A function pointer types the same for every
+// function of its signature, so `.method("a", &f).method("b", &g)` gave both
+// names whichever was registered last. One lambda handed to two names was one
+// slot. And a lambda whose captures differ per registration — the obvious way
+// to write a family of related calls, a loop over a table of names — kept only
+// the last set. Nothing diagnosed any of the three: the call succeeded and
+// answered about the wrong thing.
+
+/// Free a callable its function object no longer needs. `opaque` is the `Fn*`
+/// the registration allocated, so the delete is typed and needs no vtable.
 template<typename Fn>
-struct FnStore {
-    static inline std::optional<Fn> fn;
-};
+void delete_callable(void* opaque) {
+    delete static_cast<Fn*>(opaque);
+}
+
+/// A function object owning its own copy of `fn`. `name` and `length` are set
+/// the way `JS_NewCFunction` sets them, so `f.name` and `f.length` read the
+/// same as a plain C function's.
+///
+/// If the allocation inside QuickJS fails the callable leaks rather than being
+/// deleted here: one of the two failure paths attaches the record before
+/// throwing and has therefore already run the finalizer, and leaking once on
+/// OOM is the better of the two mistakes.
+template<typename Fn>
+JSValue new_closure(JSContext* ctx, const char* name, int length,
+                    JSCClosure* tramp, Fn&& fn) {
+    using D = std::decay_t<Fn>;
+    return JS_NewCClosure(ctx, tramp, name, &delete_callable<D>, length, 0,
+                          new D(std::forward<Fn>(fn)));
+}
 
 inline JSValue safe_arg(int argc, JSValueConst* argv, int index) {
     return (index < argc) ? argv[index] : JS_UNDEFINED;
@@ -546,29 +580,38 @@ struct StaticCaller<ClassType, Fn> {
 };
 
 // ── Trampolines (C function pointers registered with QuickJS) ──────────────
+//
+// One instantiation per callable type, and the callable itself arrives as the
+// `opaque` its function object owns — see `new_closure`.
 
 template<typename ClassType, typename Fn, bool ReturnsThis>
 JSValue method_trampoline(JSContext* ctx, JSValueConst this_val,
-                          int argc, JSValueConst* argv) {
+                          int argc, JSValueConst* argv, int, void* opaque) {
     auto* self = static_cast<ClassType*>(JS_GetOpaque(this_val, class_id<ClassType>()));
     if (!self) return JS_ThrowTypeError(ctx, "invalid this");
-    auto& fn = *FnStore<std::decay_t<Fn>>::fn;
+    auto& fn = *static_cast<std::decay_t<Fn>*>(opaque);
     return MethodCaller<ClassType, std::decay_t<Fn>, ReturnsThis>::call(
         ctx, self, fn, argc, argv, this_val);
 }
 
 template<typename ClassType, typename Fn>
 JSValue static_trampoline(JSContext* ctx, JSValueConst this_val,
-                          int argc, JSValueConst* argv) {
+                          int argc, JSValueConst* argv, int, void* opaque) {
     (void)this_val;
-    auto& fn = *FnStore<std::decay_t<Fn>>::fn;
+    auto& fn = *static_cast<std::decay_t<Fn>*>(opaque);
     return StaticCaller<ClassType, std::decay_t<Fn>>::call(ctx, fn, argc, argv);
 }
 
+// A constructor is called with `new_target` where a method gets `this`, and
+// unlike `JS_CFUNC_constructor` a closure is not told which of the two it is —
+// so the check that it was reached through `new` is made here, and stays a
+// sentence rather than becoming a read of `undefined.prototype`.
 template<typename T, typename Fn>
 JSValue ctor_trampoline(JSContext* ctx, JSValueConst new_target,
-                        int argc, JSValueConst* argv) {
-    auto& fn = *FnStore<std::decay_t<Fn>>::fn;
+                        int argc, JSValueConst* argv, int, void* opaque) {
+    if (!JS_IsConstructor(ctx, new_target))
+        return JS_ThrowTypeError(ctx, "must be called with new");
+    auto& fn = *static_cast<std::decay_t<Fn>*>(opaque);
     T* obj = fn(ctx, argc, argv);
     if (!obj) return JS_EXCEPTION;
     JSValue proto = JS_GetPropertyStr(ctx, new_target, "prototype");
@@ -587,6 +630,24 @@ inline JSValue no_constructor(JSContext* ctx, JSValueConst, int, JSValueConst*) 
 }
 
 } // namespace detail
+
+// ── Free functions on an object that already exists ─────────────────────────
+
+/// Put an auto-converting function on `obj`: `([JSContext*,] args...) → R`.
+///
+/// What `Global` and `Namespace` are made of, public because a binding that was
+/// handed an object from somewhere else — a prototype, a namespace another part
+/// of the host built — needs the same thing and should not have to reach into
+/// `detail` for it.
+template<typename Fn>
+    requires (!std::is_convertible_v<std::decay_t<Fn>, JSCFunction*>)
+void set_function(JSContext* ctx, JSValue obj, const char* name, Fn&& fn) {
+    using Caller = detail::StaticCaller<void, std::decay_t<Fn>>;
+    JS_SetPropertyStr(ctx, obj, name,
+        detail::new_closure(ctx, name, static_cast<int>(Caller::js_argc),
+                            &detail::static_trampoline<void, std::decay_t<Fn>>,
+                            std::forward<Fn>(fn)));
+}
 
 // ── Class<T> builder ────────────────────────────────────────────────────────
 //
@@ -609,8 +670,9 @@ class Class {
     const char* name_;
     unsigned flags_ = 0;
 
-    // Constructor C function pointer (null = not constructible)
-    JSCFunction* ctor_fn_ = nullptr;
+    // The constructor function, built by `constructor()` because it owns the
+    // callable (undefined = not constructible).
+    JSValue ctor_ = JS_UNDEFINED;
     int ctor_length_ = 0;
 
     // Deferred statics (applied to constructor in destructor)
@@ -683,10 +745,11 @@ public:
     Class& operator=(Class&&) = delete;
 
     ~Class() {
-        // Create constructor function
-        JSCFunction* fn = ctor_fn_ ? ctor_fn_ : detail::no_constructor;
-        JSValue ctor = JS_NewCFunction2(ctx_, fn, name_, ctor_length_,
-                                         JS_CFUNC_constructor, 0);
+        // The constructor function, or one that says the class has none
+        JSValue ctor = JS_IsUndefined(ctor_)
+            ? JS_NewCFunction2(ctx_, detail::no_constructor, name_, ctor_length_,
+                               JS_CFUNC_constructor, 0)
+            : ctor_;
 
         // Apply deferred static methods / values
         for (auto& s : statics_)
@@ -714,8 +777,13 @@ public:
 
     template<typename Fn>
     Class& constructor(Fn&& fn) {
-        detail::FnStore<std::decay_t<Fn>>::fn.emplace(std::forward<Fn>(fn));
-        ctor_fn_ = &detail::ctor_trampoline<T, std::decay_t<Fn>>;
+        if (!JS_IsUndefined(ctor_)) JS_FreeValue(ctx_, ctor_);
+        ctor_ = detail::new_closure(ctx_, name_, ctor_length_,
+                                    &detail::ctor_trampoline<T, std::decay_t<Fn>>,
+                                    std::forward<Fn>(fn));
+        // A closure is a callable object and nothing more until this is set;
+        // `new Thing()` checks the bit before it dispatches.
+        JS_SetConstructorBit(ctx_, ctor_, true);
         return *this;
     }
 
@@ -725,11 +793,10 @@ public:
     template<typename Fn>
     Class& method(const char* name, Fn&& fn) {
         using Caller = detail::MethodCaller<T, std::decay_t<Fn>, false>;
-        detail::FnStore<std::decay_t<Fn>>::fn.emplace(std::forward<Fn>(fn));
         JS_SetPropertyStr(ctx_, proto_, name,
-            JS_NewCFunction(ctx_,
+            detail::new_closure(ctx_, name, static_cast<int>(Caller::js_argc),
                 &detail::method_trampoline<T, std::decay_t<Fn>, false>,
-                name, static_cast<int>(Caller::js_argc)));
+                std::forward<Fn>(fn)));
         return *this;
     }
 
@@ -737,11 +804,10 @@ public:
     template<typename Fn>
     Class& method(const char* name, Fn&& fn, returns_this_t) {
         using Caller = detail::MethodCaller<T, std::decay_t<Fn>, true>;
-        detail::FnStore<std::decay_t<Fn>>::fn.emplace(std::forward<Fn>(fn));
         JS_SetPropertyStr(ctx_, proto_, name,
-            JS_NewCFunction(ctx_,
+            detail::new_closure(ctx_, name, static_cast<int>(Caller::js_argc),
                 &detail::method_trampoline<T, std::decay_t<Fn>, true>,
-                name, static_cast<int>(Caller::js_argc)));
+                std::forward<Fn>(fn)));
         return *this;
     }
 
@@ -750,12 +816,11 @@ public:
 
     template<typename Fn>
     Class& get(const char* name, Fn&& fn) {
-        detail::FnStore<std::decay_t<Fn>>::fn.emplace(std::forward<Fn>(fn));
         JSAtom atom = JS_NewAtom(ctx_, name);
         JS_DefinePropertyGetSet(ctx_, proto_, atom,
-            JS_NewCFunction(ctx_,
+            detail::new_closure(ctx_, name, 0,
                 &detail::method_trampoline<T, std::decay_t<Fn>, false>,
-                name, 0),
+                std::forward<Fn>(fn)),
             JS_UNDEFINED,
             JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
         JS_FreeAtom(ctx_, atom);
@@ -768,16 +833,14 @@ public:
 
     template<typename GetterFn, typename SetterFn>
     Class& prop(const char* name, GetterFn&& getter, SetterFn&& setter) {
-        detail::FnStore<std::decay_t<GetterFn>>::fn.emplace(std::forward<GetterFn>(getter));
-        detail::FnStore<std::decay_t<SetterFn>>::fn.emplace(std::forward<SetterFn>(setter));
         JSAtom atom = JS_NewAtom(ctx_, name);
         JS_DefinePropertyGetSet(ctx_, proto_, atom,
-            JS_NewCFunction(ctx_,
+            detail::new_closure(ctx_, name, 0,
                 &detail::method_trampoline<T, std::decay_t<GetterFn>, false>,
-                name, 0),
-            JS_NewCFunction(ctx_,
+                std::forward<GetterFn>(getter)),
+            detail::new_closure(ctx_, name, 1,
                 &detail::method_trampoline<T, std::decay_t<SetterFn>, false>,
-                name, 1),
+                std::forward<SetterFn>(setter)),
             JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
         JS_FreeAtom(ctx_, atom);
         return *this;
@@ -789,12 +852,11 @@ public:
     template<typename Fn>
     Class& static_method(const char* name, Fn&& fn) {
         using Caller = detail::StaticCaller<T, std::decay_t<Fn>>;
-        detail::FnStore<std::decay_t<Fn>>::fn.emplace(std::forward<Fn>(fn));
         statics_.push_back({
             name,
-            JS_NewCFunction(ctx_,
+            detail::new_closure(ctx_, name, static_cast<int>(Caller::js_argc),
                 &detail::static_trampoline<T, std::decay_t<Fn>>,
-                name, static_cast<int>(Caller::js_argc))
+                std::forward<Fn>(fn))
         });
         return *this;
     }
@@ -881,12 +943,7 @@ public:
     template<typename Fn>
         requires (!std::is_convertible_v<std::decay_t<Fn>, JSCFunction*>)
     Global& function(const char* name, Fn&& fn) {
-        using Caller = detail::StaticCaller<void, std::decay_t<Fn>>;
-        detail::FnStore<std::decay_t<Fn>>::fn.emplace(std::forward<Fn>(fn));
-        JS_SetPropertyStr(ctx_, global_, name,
-            JS_NewCFunction(ctx_,
-                &detail::static_trampoline<void, std::decay_t<Fn>>,
-                name, static_cast<int>(Caller::js_argc)));
+        set_function(ctx_, global_, name, std::forward<Fn>(fn));
         return *this;
     }
 
@@ -912,32 +969,56 @@ public:
 
     /// Access the global object for custom manipulation
     JSValue object() const { return global_; }
+
+    /// The context this is registering into
+    JSContext* context() const { return ctx_; }
 };
 
 // ── Namespace builder ──────────────────────────────────────────────────────
 //
-// RAII builder that creates a named object on globalThis.
-// The object is attached in the destructor.
+// RAII builder that creates a named object on globalThis, or inside an object
+// you already have. The object is attached in the destructor.
 //
 //   qjsbind::Namespace(ctx, "Physics")
 //       .function("setGravity", js_setGravity, 3)
 //       .function("step", [](double dt) { world->step(dt); })
 //       .function_list(physics_funcs, physics_funcs_count);
 //
+// A namespace that is not on globalThis takes its parent, because a host
+// surface is often a level or two down — `bro.ffmpeg`, and `render` inside
+// that. The parent is *borrowed*: it must outlive the namespace, which for a
+// nested one means the inner scope closes first.
+//
+//   qjsbind::Namespace media(ctx, some_obj, "media");
+//   { qjsbind::Namespace codecs(media, "codecs"); codecs.function(...); }
+//
 
 class Namespace {
     JSContext* ctx_;
     JSValue obj_;
+    JSValue parent_;  // undefined = globalThis, read in the destructor
     const char* name_;
 
 public:
-    Namespace(JSContext* ctx, const char* name) : ctx_(ctx), name_(name) {
-        obj_ = JS_NewObject(ctx);
-    }
+    Namespace(JSContext* ctx, const char* name)
+        : ctx_(ctx), obj_(JS_NewObject(ctx)), parent_(JS_UNDEFINED), name_(name) {}
+
+    /// A namespace inside a borrowed object rather than on globalThis.
+    Namespace(JSContext* ctx, JSValue parent, const char* name)
+        : ctx_(ctx), obj_(JS_NewObject(ctx)), parent_(parent), name_(name) {}
+
+    /// A namespace inside another namespace.
+    Namespace(Namespace& parent, const char* name)
+        : Namespace(parent.ctx_, parent.obj_, name) {}
+
     ~Namespace() {
-        JSValue global = JS_GetGlobalObject(ctx_);
-        JS_SetPropertyStr(ctx_, global, name_, obj_);
-        JS_FreeValue(ctx_, global);
+        if (JS_IsUndefined(parent_)) {
+            JSValue global = JS_GetGlobalObject(ctx_);
+            JS_SetPropertyStr(ctx_, global, name_, obj_);
+            JS_FreeValue(ctx_, global);
+        } else {
+            JS_SetPropertyStr(ctx_, parent_, name_, obj_);
+        }
     }
 
     Namespace(const Namespace&) = delete;
@@ -956,12 +1037,7 @@ public:
     template<typename Fn>
         requires (!std::is_convertible_v<std::decay_t<Fn>, JSCFunction*>)
     Namespace& function(const char* name, Fn&& fn) {
-        using Caller = detail::StaticCaller<void, std::decay_t<Fn>>;
-        detail::FnStore<std::decay_t<Fn>>::fn.emplace(std::forward<Fn>(fn));
-        JS_SetPropertyStr(ctx_, obj_, name,
-            JS_NewCFunction(ctx_,
-                &detail::static_trampoline<void, std::decay_t<Fn>>,
-                name, static_cast<int>(Caller::js_argc)));
+        set_function(ctx_, obj_, name, std::forward<Fn>(fn));
         return *this;
     }
 
@@ -987,6 +1063,9 @@ public:
 
     /// Access the namespace object for custom manipulation
     JSValue object() const { return obj_; }
+
+    /// The context this is registering into
+    JSContext* context() const { return ctx_; }
 };
 
 } // namespace qjsbind

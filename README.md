@@ -12,6 +12,7 @@ A C++20 header-only binding library for [QuickJS](https://bellard.org/quickjs/),
 - **Fluent builder API** -- register classes, methods, and properties with readable method chaining
 - **Automatic type conversion** -- bidirectional conversion between C++ and JS types (`bool`, all arithmetic types, `std::string`, `const char*`, `std::optional<T>`, raw `JSValue`, and auto-wrapped registered-class pointers)
 - **RAII registration** -- `Class` / `Global` / `Namespace` builders finalize registration automatically in their destructors
+- **Per-registration closures** -- each registration's callable is owned by the JS function object that calls it and freed with it, so captures are never shared between registrations and a function pointer is as safe to register as a lambda
 - **Flexible** -- supports constructors, instance/static methods, getters, read-write properties, constants, optional arguments, custom finalizers, exotic methods, GC marking, and raw `JSCFunction` escape hatches
 - **Typed-array & promise helpers** -- build/read `Float32Array`/`Int32Array` buffers and create immediately-resolved/rejected promises with one call
 
@@ -116,6 +117,28 @@ qjsbind::Namespace(ctx, "Math2")
     .function("lerp", [](double a, double b, double t) { return a + (b - a) * t; });
 ```
 
+A namespace can also live inside an object you already have, or inside another
+namespace, for a host surface that sits a level or two below `globalThis`. The
+parent is borrowed and must outlive the namespace, so a nested one goes in its
+own scope -- the inner object is attached to the outer when it is destroyed:
+
+```cpp
+qjsbind::Namespace host(ctx, some_object, "ffmpeg");   // some_object.ffmpeg
+{
+    qjsbind::Namespace render(host, "render");         // some_object.ffmpeg.render
+    render.function("start", [](JSValue spec) { ... });
+}
+```
+
+### Registered callables
+
+Each registration owns its own copy of the callable, held by the JS function
+object and freed when that object is collected. Nothing is keyed on the
+callable's type, so all of these do what they look like: one lambda registered
+under several names, a family of functions built from one lambda expression with
+different captures, a plain function pointer, and the same bindings installed
+into a second runtime.
+
 ### Automatic type conversion
 
 | C++ type | JS type | Direction |
@@ -129,6 +152,10 @@ qjsbind::Namespace(ctx, "Math2")
 | `JSValue` | Passthrough | both |
 
 ### Helper functions
+
+Registration:
+
+- `qjsbind::set_function(ctx, obj, name, fn)` -- put one auto-converting function on an object you already have (what `Global` and `Namespace` are made of)
 
 Wrapping:
 
