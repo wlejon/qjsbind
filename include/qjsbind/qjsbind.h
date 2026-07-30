@@ -438,6 +438,14 @@ void delete_callable(void* opaque) {
 /// deleted here: one of the two failure paths attaches the record before
 /// throwing and has therefore already run the finalizer, and leaking once on
 /// OOM is the better of the two mistakes.
+///
+/// One difference from a plain C function matters if you run several realms in
+/// one runtime: QuickJS switches to a C function's defining realm before calling
+/// it and does not do that for a closure, so the `JSContext*` a callable is
+/// handed is the *calling* realm's. It shows only for a function object that
+/// crosses realms, and only where the context decides the answer — `wrap<T>`
+/// reads the class prototype out of it. Both of QuickJS-NG's closure kinds are
+/// like this and both say so in the same TODO; it is not a choice made here.
 template<typename Fn>
 JSValue new_closure(JSContext* ctx, const char* name, int length,
                     JSCClosure* tramp, Fn&& fn) {
